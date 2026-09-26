@@ -38,6 +38,65 @@ local COM_TINT = { "#e3b341", 0.22 }
 --          old_start, old_end, snippet }
 local comments = {}
 
+--- notices -----------------------------------------------------------------
+
+-- One-line feedback for the user. `maki.notify` rather than `maki.ui.flash`
+-- because it also logs when there is no UI, and a plugin that installs a notify
+-- handler (stacked toasts, say) then sees review messages like everyone else's.
+-- A level is what labels the message, so plain key feedback stays bare.
+local function notice(msg, level)
+  if level then
+    maki.notify(msg, level, { title = "review" })
+  else
+    maki.notify(msg)
+  end
+end
+
+--- text helpers ------------------------------------------------------------
+
+-- Keeps the well-formed UTF-8 out of {s}. A buffer line and any string handed
+-- back to the host must decode, or the Lua-to-Rust conversion fails, and git
+-- hands us raw bytes for names and file content. `utf8.len` answers nil plus
+-- the byte position of the first problem (it does not raise), and
+-- `utf8.offset` only refuses a continuation byte, so neither walks a damaged
+-- string alone. What `utf8.len` accepts up to that position is safe to keep.
+local function sanitize_utf8(s)
+  if not s or s == "" then
+    return s
+  end
+  local out, i, n = {}, 1, #s
+  while i <= n do
+    local ok, count, bad = pcall(utf8.len, s, i, n)
+    if ok and count then
+      out[#out + 1] = s:sub(i)
+      break
+    end
+    local stop = (bad or n + 1) - 1
+    if stop >= i then
+      out[#out + 1] = s:sub(i, stop)
+    end
+    i = stop + 2 -- step over the byte utf8.len could not decode
+  end
+  return table.concat(out)
+end
+
+-- Splits git's `-z` output on NUL. Every field ends at a NUL and paths come
+-- through exactly as they are on disk: no quoting, no octal escapes, and a
+-- space, tab, quote or newline in a name cannot fake a record separator.
+local function split_z(s)
+  local out, i = {}, 1
+  while i <= #s do
+    local j = s:find("\0", i, true)
+    if not j then
+      out[#out + 1] = s:sub(i)
+      break
+    end
+    out[#out + 1] = s:sub(i, j - 1)
+    i = j + 1
+  end
+  return out
+end
+
 --- shell helpers -----------------------------------------------------------
 
 local function sh_quote(s)
@@ -53,7 +112,7 @@ local function run(cmd)
   end
   -- git diff exits 1 when files differ (--no-index); only treat >1 as failure.
   if res.exit_code > 1 then
-    local err = (res.stderr or ""):match("^%s*(.-)%s*$")
+    local err = sanitize_utf8((res.stderr or ""):match("^%s*(.-)%s*$"))
     return nil, err ~= "" and err or ("exit " .. res.exit_code)
   end
   return res.stdout or ""
@@ -84,7 +143,10 @@ local function get_tints()
     return tints
   end
   local bg = maki.ui.theme_color("background")
-  if not bg then
+  -- theme_color also answers a palette index ("4") or "default" when the theme
+  -- names no truecolor rgb. blend() only understands "#rrggbb", so a tint is
+  -- dropped rather than guessed.
+  if not bg or not bg:match("^#%x%x%x%x%x%x$") then
     tints = {}
     return tints
   end
@@ -109,6 +171,51 @@ local function comment_count(change)
   return n
 end
 
+-- { status, path } pairs from `--name-status -z` fields. A rename or a copy
+-- names both sides, and only the new path can be handed back to git later.
+local function parse_name_status(fields)
+  local out, i = {}, 1
+  while i <= #fields do
+    local status = (fields[i] or ""):sub(1, 1)
+    local path
+    local step
+    if status == "R" or status == "C" then
+      path = fields[i + 2]
+      step = 3
+    else
+      path = fields[i + 1]
+      step = 2
+    end
+    if path and path ~= "" then
+      out[#out + 1] = { status = status, path = path }
+    end
+    i = i + step
+  end
+  return out
+end
+
+-- { adds, dels, path } triples from `--numstat -z` fields. Counts and path share
+-- one field, except for a rename, where git closes the counts field at the tab
+-- and puts both paths in the next two fields.
+local function parse_numstat(fields)
+  local out, i = {}, 1
+  while i <= #fields do
+    local adds, dels, path = (fields[i] or ""):match("^(%S+)\t(%S+)\t(.*)$")
+    local step = 1
+    if adds then
+      if path == "" then
+        path = fields[i + 2]
+        step = 3
+      end
+      if path and path ~= "" then
+        out[#out + 1] = { adds = adds, dels = dels, path = path }
+      end
+    end
+    i = i + step
+  end
+  return out
+end
+
 -- Returns array of { path, status, adds, dels, untracked, binary } or nil, err.
 local function git_changes()
   local ok, err = run("git rev-parse --is-inside-work-tree")
@@ -118,35 +225,27 @@ local function git_changes()
 
   local changes, seen = {}, {}
 
-  local ns = run("git diff --no-color --name-status HEAD") or ""
-  for line in ns:gmatch("[^\n]+") do
-    local status, rest = line:match("^(%S+)\t(.+)$")
-    if status then
-      local path = rest:match("\t(.+)$") or rest -- renames: keep new path
-      seen[path] = #changes + 1
-      changes[#changes + 1] =
-        { path = path, status = status:sub(1, 1), adds = 0, dels = 0 }
-    end
+  local ns = run("git diff --no-color --name-status -z HEAD") or ""
+  for _, rec in ipairs(parse_name_status(split_z(ns))) do
+    seen[rec.path] = #changes + 1
+    changes[#changes + 1] = { path = rec.path, status = rec.status, adds = 0, dels = 0 }
   end
 
-  local numstat = run("git diff --no-color --numstat HEAD") or ""
-  for line in numstat:gmatch("[^\n]+") do
-    local adds, dels, path = line:match("^(%S+)\t(%S+)\t(.+)$")
-    if path then
-      local idx = seen[path]
-      if idx then
-        if adds == "-" then
-          changes[idx].binary = true
-        else
-          changes[idx].adds = tonumber(adds) or 0
-          changes[idx].dels = tonumber(dels) or 0
-        end
+  local numstat = run("git diff --no-color --numstat -z HEAD") or ""
+  for _, rec in ipairs(parse_numstat(split_z(numstat))) do
+    local idx = seen[rec.path]
+    if idx then
+      if rec.adds == "-" then
+        changes[idx].binary = true
+      else
+        changes[idx].adds = tonumber(rec.adds) or 0
+        changes[idx].dels = tonumber(rec.dels) or 0
       end
     end
   end
 
-  local untracked = run("git ls-files --others --exclude-standard") or ""
-  for path in untracked:gmatch("[^\n]+") do
+  local untracked = run("git ls-files --others --exclude-standard -z") or ""
+  for _, path in ipairs(split_z(untracked)) do
     if not seen[path] then
       changes[#changes + 1] =
         { path = path, status = "?", adds = 0, dels = 0, untracked = true }
@@ -180,37 +279,30 @@ end
 local function git_commit_changes(sha)
   local changes, seen = {}, {}
   local ns, err =
-    run("git diff-tree -r --root --no-commit-id --name-status " .. sha)
+    run("git diff-tree -r --root --no-commit-id --name-status -z " .. sha)
   if not ns then
     return nil, err
   end
-  for line in ns:gmatch("[^\n]+") do
-    local status, rest = line:match("^(%S+)\t(.+)$")
-    if status then
-      local path = rest:match("\t(.+)$") or rest
-      seen[path] = #changes + 1
-      changes[#changes + 1] = {
-        path = path,
-        status = status:sub(1, 1),
-        adds = 0,
-        dels = 0,
-        commit = sha,
-      }
-    end
+  for _, rec in ipairs(parse_name_status(split_z(ns))) do
+    seen[rec.path] = #changes + 1
+    changes[#changes + 1] = {
+      path = rec.path,
+      status = rec.status,
+      adds = 0,
+      dels = 0,
+      commit = sha,
+    }
   end
   local numstat =
-    run("git diff-tree -r --root --no-commit-id --numstat " .. sha) or ""
-  for line in numstat:gmatch("[^\n]+") do
-    local adds, dels, path = line:match("^(%S+)\t(%S+)\t(.+)$")
-    if path then
-      local idx = seen[path]
-      if idx then
-        if adds == "-" then
-          changes[idx].binary = true
-        else
-          changes[idx].adds = tonumber(adds) or 0
-          changes[idx].dels = tonumber(dels) or 0
-        end
+    run("git diff-tree -r --root --no-commit-id --numstat -z " .. sha) or ""
+  for _, rec in ipairs(parse_numstat(split_z(numstat))) do
+    local idx = seen[rec.path]
+    if idx then
+      if rec.adds == "-" then
+        changes[idx].binary = true
+      else
+        changes[idx].adds = tonumber(rec.adds) or 0
+        changes[idx].dels = tonumber(rec.dels) or 0
       end
     end
   end
@@ -221,7 +313,9 @@ local function git_commit_changes(sha)
 end
 
 -- Parses unified diff text into { kind, text, old_ln, new_ln } lines.
--- kind: "hunk" | "ctx" | "add" | "del". Meta lines are dropped.
+-- kind: "hunk" | "ctx" | "add" | "del". Meta lines are dropped. Line text is
+-- file content, so it is cleaned here, once: it feeds the buffer, the syntax
+-- highlighter and the comment snippets that go to the model.
 local function parse_diff(raw)
   local out = {}
   local old_ln, new_ln = 0, 0
@@ -235,19 +329,27 @@ local function parse_diff(raw)
     if os_ then
       old_ln, new_ln = tonumber(os_), tonumber(ns_)
       in_hunk = true
-      out[#out + 1] = { kind = "hunk", text = line }
+      out[#out + 1] = { kind = "hunk", text = sanitize_utf8(line) }
     elseif in_hunk then
       local c = line:sub(1, 1)
       if c == "+" then
-        out[#out + 1] = { kind = "add", text = line:sub(2), new_ln = new_ln }
+        out[#out + 1] = {
+          kind = "add",
+          text = sanitize_utf8(line:sub(2)),
+          new_ln = new_ln,
+        }
         new_ln = new_ln + 1
       elseif c == "-" then
-        out[#out + 1] = { kind = "del", text = line:sub(2), old_ln = old_ln }
+        out[#out + 1] = {
+          kind = "del",
+          text = sanitize_utf8(line:sub(2)),
+          old_ln = old_ln,
+        }
         old_ln = old_ln + 1
       elseif c == " " then
         out[#out + 1] = {
           kind = "ctx",
-          text = line:sub(2),
+          text = sanitize_utf8(line:sub(2)),
           old_ln = old_ln,
           new_ln = new_ln,
         }
@@ -406,7 +508,7 @@ local function build_prompt()
     "",
   }
   for _, file in ipairs(order) do
-    p[#p + 1] = "## " .. file
+    p[#p + 1] = "## " .. sanitize_utf8(file)
     for i, c in ipairs(by_file[file]) do
       p[#p + 1] = ""
       local where = line_range_label(c)
@@ -427,81 +529,97 @@ local function build_prompt()
   return table.concat(p, "\n")
 end
 
+-- Closes every pane. A focused window is handed every key, so one left open
+-- with nobody reading its `recv` would lock the keyboard for the session.
+local function close_windows(state)
+  for _, w in ipairs({ "fwin", "cwin", "mwin", "rwin" }) do
+    if state[w] then
+      state[w]:close()
+      state[w] = nil
+    end
+  end
+end
+
 local function submit(state)
   if #comments == 0 then
-    maki.ui.flash("No review comments yet — press c on a diff line first")
+    notice("No review comments yet — press c on a diff line first")
     return false
   end
   local n = #comments
   local prompt = build_prompt()
   local _, err = maki.session.new({ prompt = prompt, focus = true })
   if err then
-    maki.ui.flash("Failed to start session: " .. err)
+    notice("Failed to start session: " .. err, "error")
     return false
   end
   comments = {}
   if state then
-    for _, w in ipairs({ "fwin", "cwin", "mwin", "rwin" }) do
-      if state[w] then
-        state[w]:close()
-      end
-    end
+    close_windows(state)
   end
-  maki.ui.flash("Sent " .. n .. " comment(s) to a new session")
+  notice("Sent " .. n .. " comment(s) to a new session")
   return true
 end
 
 --- span helpers ------------------------------------------------------------
 
+-- The first {cells} display cells of {s}, cut on a character boundary. The host
+-- does the measuring, so a wide character counts as the two cells it takes
+-- rather than the one codepoint it is.
+local function cut_cells(s, cells)
+  if cells < 1 then
+    return ""
+  end
+  local ok, t = pcall(maki.ui.truncate_text, s, cells)
+  if ok and type(t) == "table" and t.head then
+    return t.head
+  end
+  return sanitize_utf8(s):sub(1, cells)
+end
+
+-- Display cells {s} occupies, measured the way the renderer measures it.
+local function display_len(s)
+  if not s or s == "" then
+    return 0
+  end
+  local ok, w = pcall(maki.ui.display_width, s)
+  if ok and w then
+    return w
+  end
+  return #sanitize_utf8(s)
+end
+
+-- Wraps {text} to {width} cells, breaking at a space near the limit when there
+-- is one and never inside a character.
 local function wrap(text, width)
   local lines = {}
-  for raw in (text .. "\n"):gmatch("(.-)\n") do
+  for raw in (sanitize_utf8(text) .. "\n"):gmatch("(.-)\n") do
     if raw == "" then
       lines[#lines + 1] = ""
     end
-    while #raw > 0 do
-      if #raw <= width then
+    while raw ~= "" do
+      if display_len(raw) <= width then
         lines[#lines + 1] = raw
         break
       end
-      local cut = width
-      for i = width, math.max(width - 20, 1), -1 do
-        if raw:sub(i, i) == " " then
-          cut = i
+      local head = cut_cells(raw, width)
+      local keep = #head
+      for i = keep, math.max(keep - 20, 1), -1 do
+        if head:sub(i, i) == " " then
+          keep = i
           break
         end
       end
-      lines[#lines + 1] = raw:sub(1, cut)
-      raw = raw:sub(cut + 1):gsub("^%s+", "")
+      if keep == 0 then
+        -- One character wider than the pane: cut it out of the source, or the
+        -- loop would never advance.
+        local ok, nxt = pcall(utf8.offset, raw, 2, 1)
+        keep = (ok and nxt and nxt > 1) and (nxt - 1) or 1
+      end
+      lines[#lines + 1] = raw:sub(1, keep)
+      raw = raw:sub(keep + 1):gsub("^%s+", "")
     end
   end
   return lines
-end
-
-local function display_len(s)
-  local ok, n = pcall(utf8.len, s)
-  if ok and n then
-    return n
-  end
-  return #s
-end
-
-local function sanitize_utf8(s)
-  if not s or s == "" then return s end
-  local ok = pcall(utf8.len, s)
-  if ok then return s end
-  -- Extract valid UTF-8 characters, skip invalid bytes
-  local out, i, n = {}, 1, #s
-  while i <= n do
-    local ok, next = pcall(utf8.offset, s, 1, i)
-    if ok then
-      out[#out + 1] = s:sub(i, next - 1)
-      i = next
-    else
-      i = i + 1
-    end
-  end
-  return table.concat(out)
 end
 
 local function spans_len(spans)
@@ -554,11 +672,19 @@ local STATUS_STYLE =
   { M = "warning", A = "diff_new", D = "diff_old", R = "accent", ["?"] = "diff_new" }
 
 -- Shortens a path from the left to fit `max` columns.
+-- Shortens a path from the left to fit `max` cells, because the file name
+-- matters more than the directories in front of it. Git paths are byte strings,
+-- so the result is cleaned on the way out and every caller can paint it.
 local function fit_path(path, max)
-  if display_len(path) <= max then
-    return path
+  local shown = sanitize_utf8(path)
+  if display_len(shown) <= max then
+    return shown
   end
-  return "…" .. path:sub(-(max - 1))
+  local tail = shown:sub(-(max - 1))
+  while display_len("…" .. tail) > max and #tail > 1 do
+    tail = tail:sub(2) -- the slice can start inside a character: shave to fit
+  end
+  return sanitize_utf8("…" .. tail)
 end
 
 -- Builds a directory tree from a flat change list. Single-child directory
@@ -726,16 +852,9 @@ local function render_commit_list(state)
     local sha = sanitize_utf8(cm.sha or "")
     local when = sanitize_utf8(cm.when or ""):gsub(" ago$", "")
     local subject = sanitize_utf8(cm.subject or "")
-    local avail = width - #sha - display_len(when) - 4
+    local avail = width - display_len(sha) - display_len(when) - 4
     if display_len(subject) > avail then
-      local cut = math.max(avail - 1, 1)
-      -- Ensure `cut` lands on a UTF-8 boundary
-      while cut > 0 do
-        local ok, pos = pcall(utf8.offset, subject, 0, cut + 1)
-        if ok and pos == cut + 1 then break end
-        cut = cut - 1
-      end
-      subject = subject:sub(1, cut) .. "…"
+      subject = cut_cells(subject, avail - 1) .. "…"
     end
     local spans = {
       { " " .. sha .. " ", "accent" },
@@ -782,9 +901,9 @@ local function render_comment_list(state)
     }
     local avail = width - 3 - display_len(loc) - 2
     if avail > 4 then
-      local preview = c.text:gsub("%s+", " ")
+      local preview = sanitize_utf8(c.text):gsub("%s+", " ")
       if display_len(preview) > avail then
-        preview = preview:sub(1, math.max(avail - 1, 1)) .. "…"
+        preview = cut_cells(preview, avail - 1) .. "…"
       end
       spans[#spans + 1] = { " " .. preview, "dim" }
     end
@@ -902,10 +1021,11 @@ local function render_diff(state)
       }
       local r =
         state.centry.input:render("    │ ", 6, math.max(width - 8, 20))
+      local first = #lines + 1
       for _, l in ipairs(r.lines) do
         lines[#lines + 1] = l
-        editor_row = #lines
       end
+      editor_row = first + (r.cursor_row or 1) - 1
       lines[#lines + 1] = { { "    └", "accent" } }
     end
 
@@ -978,7 +1098,7 @@ local function render_comment_detail(state)
     where = where .. "  ·  commit " .. c.commit
   end
   lines[#lines + 1] = { { "", "" } }
-  lines[#lines + 1] = { { " " .. c.file, "accent" } }
+  lines[#lines + 1] = { { " " .. sanitize_utf8(c.file), "accent" } }
   lines[#lines + 1] = { { " " .. where, "dim" } }
   lines[#lines + 1] = { { "", "" } }
   local cbg = tint.com
@@ -1254,7 +1374,7 @@ local PANE_NEXT = { files = "commits", commits = "comments", comments = "files" 
 
 local function set_pane(state, pane)
   if pane == "diff" and not state.dlines then
-    maki.ui.flash("No diff to focus")
+    notice("No diff to focus")
     return
   end
   if state.pane == pane then
@@ -1284,7 +1404,7 @@ local function enter_commit(state)
   end
   local ch, err = git_commit_changes(cm.sha)
   if not ch then
-    maki.ui.flash("commit diff failed: " .. tostring(err))
+    notice("commit diff failed: " .. tostring(err), "error")
     return
   end
   state.saved_ccursor = state.ccursor
@@ -1315,11 +1435,11 @@ end
 local function delete_selected_comment(state)
   local idx = state.mrow_map and state.mrow_map[state.mcursor]
   if not idx or not comments[idx] then
-    maki.ui.flash("No comment selected")
+    notice("No comment selected")
     return
   end
   table.remove(comments, idx)
-  maki.ui.flash("Comment deleted")
+  notice("Comment deleted")
   if state.mcursor > 1 then
     state.mcursor = state.mcursor - 1
   end
@@ -1415,7 +1535,7 @@ local function open_comment_editor(state)
   local at = state.drow_map[state.dcursor]
   local dl = state.dlines and state.dlines[at]
   if not dl or dl.kind == "hunk" then
-    maki.ui.flash("Move onto a diff line first (j/k)")
+    notice("Move onto a diff line first (j/k)")
     return
   end
 
@@ -1452,7 +1572,7 @@ end
 
 local function save_comment(state)
   local e = state.centry
-  local text = e.input:value():match("^%s*(.-)%s*$")
+  local text = sanitize_utf8(e.input:value():match("^%s*(.-)%s*$"))
   state.centry = nil
   if text == "" then
     redraw(state)
@@ -1475,10 +1595,10 @@ local function delete_comment(state)
   local _, idx = comment_at(state.change, dl)
   if idx then
     table.remove(comments, idx)
-    maki.ui.flash("Comment deleted")
+    notice("Comment deleted")
     redraw(state)
   else
-    maki.ui.flash("No comment on this line")
+    notice("No comment on this line")
   end
 end
 
@@ -1510,11 +1630,7 @@ end
 -- Opens (or reopens) all panes. Only the Files window takes focus and
 -- receives keys; the other windows are display-only.
 local function open_windows(state)
-  for _, w in ipairs({ "fwin", "cwin", "mwin", "rwin" }) do
-    if state[w] then
-      state[w]:close()
-    end
-  end
+  close_windows(state)
   local L = layout()
   state.rwin = maki.ui.open_win(state.rbuf, {
     title = " Diff ",
@@ -1563,18 +1679,22 @@ end
 
 --- main loop ---------------------------------------------------------------
 
+-- State of the review that is on screen right now, so the wrapper can tear the
+-- windows down even when the handler dies part way through.
+local open_state = nil
+
 local function open_review()
   local changes, err = git_changes()
   if not changes then
-    maki.ui.flash(tostring(err))
+    notice(tostring(err), "error")
     return
   end
 
   local state = {
-    fbuf = maki.ui.buf(),
-    cbuf = maki.ui.buf(),
-    mbuf = maki.ui.buf(),
-    rbuf = maki.ui.buf(),
+    fbuf = maki.ui.buf({ scratch = true }),
+    cbuf = maki.ui.buf({ scratch = true }),
+    mbuf = maki.ui.buf({ scratch = true }),
+    rbuf = maki.ui.buf({ scratch = true }),
     pane = "files",
     src = "files",
     wchanges = changes,
@@ -1591,6 +1711,7 @@ local function open_review()
     ccollapsed = {},
     cache = {},
   }
+  open_state = state
   open_windows(state)
   redraw(state) -- build row maps before the first preview
   for r = 1, state.fbuf:len() do
@@ -1633,9 +1754,9 @@ local function open_review()
 
     -- Comment editor owns the keyboard while open.
     if state.centry then
-      if key == "enter" then
+      if key == "<CR>" then
         save_comment(state)
-      elseif key == "esc" or key == "ctrl+c" then
+      elseif key == "<Esc>" or key == "<C-c>" then
         state.centry = nil
         redraw(state)
       else
@@ -1646,33 +1767,33 @@ local function open_review()
       continue
     end
 
-    if key == "up" or key == "k" then
+    if key == "<Up>" or key == "k" then
       move(state, -1)
-    elseif key == "down" or key == "j" then
+    elseif key == "<Down>" or key == "j" then
       move(state, 1)
-    elseif key == "pageup" then
+    elseif key == "<PageUp>" then
       move(state, -1, math.max(active_height(state) - 2, 1))
-    elseif key == "pagedown" then
+    elseif key == "<PageDown>" then
       move(state, 1, math.max(active_height(state) - 2, 1))
-    elseif key == "g" or key == "home" then
+    elseif key == "g" or key == "<Home>" then
       jump(state, false)
-    elseif key == "G" or key == "end" then
+    elseif key == "G" or key == "<End>" then
       jump(state, true)
-    elseif key == "tab" then
+    elseif key == "<Tab>" then
       set_pane(state, state.pane == "diff" and state.src or PANE_NEXT[state.pane])
     elseif key == "s" then
       if submit(state) then
         return
       end
       redraw(state)
-    elseif key == "q" or key == "ctrl+c" then
+    elseif key == "q" or key == "<C-c>" then
       break
     elseif state.pane ~= "diff" then -- one of the left panels
-      if key == "enter" or key == "l" or key == "right" then
+      if key == "<CR>" or key == "l" or key == "<Right>" then
         if state.pane == "commits" and not state.commit then
           enter_commit(state)
         elseif state.pane == "comments" then
-          maki.ui.flash("d deletes the selected comment")
+          notice("d deletes the selected comment")
         else
           local cursor, row_map = active_view(state)
           local sel = row_map[cursor]
@@ -1686,7 +1807,7 @@ local function open_review()
         delete_selected_comment(state)
       elseif key == "r" then
         refresh(state)
-      elseif key == "h" or key == "left" then
+      elseif key == "h" or key == "<Left>" then
         local cursor, row_map = active_view(state)
         local sel = row_map[cursor]
         local set = state.pane == "commits" and state.ccollapsed
@@ -1701,7 +1822,7 @@ local function open_review()
         elseif state.pane == "commits" and state.commit then
           leave_commit(state)
         end
-      elseif key == "esc" then
+      elseif key == "<Esc>" then
         if state.pane == "commits" and state.commit then
           leave_commit(state)
         else
@@ -1709,7 +1830,7 @@ local function open_review()
         end
       end
     else -- diff pane
-      if key == "c" or key == "enter" then
+      if key == "c" or key == "<CR>" then
         open_comment_editor(state)
       elseif key == "v" then
         if state.vstart then
@@ -1721,7 +1842,7 @@ local function open_review()
         redraw(state)
       elseif key == "d" then
         delete_comment(state)
-      elseif key == "h" or key == "left" or key == "esc" then
+      elseif key == "h" or key == "<Left>" or key == "<Esc>" then
         if state.vstart then
           state.vstart = nil
           redraw(state)
@@ -1732,22 +1853,22 @@ local function open_review()
     end
   end
 
-  for _, w in ipairs({ "fwin", "cwin", "mwin", "rwin" }) do
-    if state[w] then
-      state[w]:close()
-    end
+  close_windows(state)
+end
+
+local function open_review_safe()
+  local ok, err = pcall(open_review)
+  if open_state then
+    close_windows(open_state)
+    open_state = nil
+  end
+  if not ok then
+    maki.log.error("review crashed: " .. tostring(err))
+    notice("review error: " .. tostring(err), "error")
   end
 end
 
 --- registration ------------------------------------------------------------
-
-local function open_review_safe()
-  local ok, err = pcall(open_review)
-  if not ok then
-    maki.log.error("review crashed: " .. tostring(err))
-    maki.ui.flash("review error: " .. tostring(err))
-  end
-end
 
 maki.api.register_command({
   name = "/review",
@@ -1773,7 +1894,7 @@ maki.api.create_autocmd("TurnEnd", {
       end
       if n > 0 and out ~= last_sig then
         last_sig = out
-        maki.ui.flash(n .. " file(s) changed — /review to inspect & comment")
+        notice(n .. " file(s) changed — /review to inspect & comment")
       end
     end)
   end,
