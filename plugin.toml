@@ -1,0 +1,25 @@
+# maki package manifest. See https://maki.sh/docs/packages/
+# A package keeps only what this file names, so every guarded call the plugin
+# makes has to appear here.
+
+min_maki_version = "0.7.1"
+
+[permissions]
+# maki.fn.jobstart() and maki.fn.jobwait(): the panel asks git for the working
+# tree, the commit list and the diffs. This is the whole reason the plugin needs
+# no file permission: every byte it shows comes from a git command.
+run = true
+# maki.session.new({ prompt = ..., focus = true }): `s` starts the fixing
+# session. A new session that carries a prompt starts a turn, and the host asks
+# for `agent` for that on top of the write.
+agent = true
+# The same call adds a session to the conversation.
+session_write = true
+
+# Deliberately absent:
+#   fs_read / fs_write  the plugin reads nothing but through git
+#   net                 no requests
+#   env                 no environment lookups
+#   session_read        the one event it subscribes to is TurnEnd, whose fields
+#                       (reason, usage, cost, counts) are all metadata, so maki
+#                       withholds nothing from it and logs no warning
